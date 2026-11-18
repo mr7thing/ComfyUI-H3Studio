@@ -12,6 +12,30 @@ export as one video.
 
 > Want one-line answers instead? [Quick recipes](GUIDE.md).
 
+## Fork note (mr7thing/ComfyUI-H3Studio)
+
+This is a fork of [shootthesound/ComfyUI-H3Studio](https://github.com/shootthesound/ComfyUI-H3Studio)
+with one change: the per-row strength-label patch (`h3_row_aug_patch.py`) now
+also understands **ComfyUI 0.45's masked-row timestep table**.
+
+Upstream's patch anchors on an exact block of core's `_forward` source. ComfyUI
+0.45 added differential-diffusion masked rows, which put a block of per-row
+timestep maths between `seg_t` and `unique_t` — so the anchor upstream ships
+no longer matches, and keyframe strengths below 1.0 fall back to the softer
+blended label. This fork adds a third core shape
+(`v0.45-masked`) whose replacement keeps the masked-row timesteps in the set,
+because core looks them up per row by `rows_to_mod_index()`.
+
+The first two core shapes still work exactly as upstream. If core changes
+again, the patch fails loudly and falls back to blending, as before.
+
+Install from this fork:
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/mr7thing/ComfyUI-H3Studio
+```
+
 ## Install
 
 ```bash

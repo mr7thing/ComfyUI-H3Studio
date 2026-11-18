@@ -23,10 +23,16 @@ source, verify the expected block exists verbatim, substitute, recompile in
 the module's namespace). Core drift makes install() fail loudly and callers
 fall back to node-side blending with the global label — degraded but sane.
 
-TWO CORE SHAPES. ComfyUI's e01fb4c added keyframe audio, which put a
-`cond_audio` segment kind into the timestep table. The anchor block therefore
-exists in two forms and we accept either; the replacement is written to cover
-both, so there is one substitution to maintain rather than two. See h3_core.
+THREE CORE SHAPES. ComfyUI's e01fb4c added keyframe audio, which put a
+`cond_audio` segment kind into the timestep table. ComfyUI 0.45 then added
+differential-diffusion masked rows, which put a block of per-row timestep
+maths BETWEEN `seg_t` and `unique_t`. So the block we replace exists in
+three forms and we accept any of them; see `_SHAPES` below, which pairs each
+anchor with the replacement and the self-check marker that goes with it. The
+0.45 shape is the odd one out: its `unique_t` has to keep the masked-row
+timesteps in the set (they are looked up by `rows_to_mod_index`), so its
+replacement carries those unions over instead of rebuilding the set from the
+segment labels alone. See h3_core.
 """
 
 import inspect
@@ -116,6 +122,67 @@ _FWD_NEW_2 = """\
     for _si, (a, b, kind) in enumerate(layout.segments):
         row_base = t_row[_seg_t_list[_si]] * 3
 """
+
+# --- anchor 1, third shape: ComfyUI 0.45's masked-row timestep table ---------
+#
+# 0.45 grew differential diffusion: a denoise mask gives the masked rows their
+# own timestep, and those values are looked up per row by rows_to_mod_index().
+# That block sits BETWEEN seg_t and unique_t, so the contiguous anchor the
+# first two shapes use no longer exists. The tail we can still anchor on is
+# the unique_t/t_row pair -- and its replacement has to carry the masked-row
+# unions over, or t_row[v] raises KeyError the moment a mask is in play.
+#
+# (The seg_t dict itself is identical to the one the first two shapes define,
+# so core's own copy is left alone.)
+
+_FWD_OLD_1_V045 = """\
+    unique_t = sorted({t_v, t_a} | {seg_t[k] for _, _, k in layout.segments}
+                      | (set(video_rows_t.unique().tolist()) if video_rows_t is not None else set())
+                      | (set(audio_rows_t.unique().tolist()) if audio_rows_t is not None else set()))
+    t_row = {t: i for i, t in enumerate(unique_t)}
+"""
+
+_FWD_NEW_1_V045 = """\
+    _vid_augs = payload.get("cond_video_noise_augs") or None
+    _aud_augs = payload.get("cond_audio_noise_augs") or None
+    _seg_t_list = []
+    _vc_i = 0
+    _ac_i = 0
+    for _sa, _sb, _sk in layout.segments:
+        if _sk in ("cond", "ref_img"):
+            if _vid_augs is not None and _vc_i < len(_vid_augs):
+                _seg_t_list.append(max(t_v, float(_vid_augs[_vc_i])))
+            else:
+                _seg_t_list.append(seg_t[_sk])
+            _vc_i += 1
+        elif _sk in ("cond_audio", "ref_audio"):
+            if _aud_augs is not None and _ac_i < len(_aud_augs):
+                _seg_t_list.append(max(t_a, float(_aud_augs[_ac_i])))
+            else:
+                _seg_t_list.append(seg_t[_sk])
+            _ac_i += 1
+        else:
+            _seg_t_list.append(seg_t[_sk])
+    unique_t = sorted({t_v, t_a} | set(_seg_t_list)
+                      | (set(video_rows_t.unique().tolist()) if video_rows_t is not None else set())
+                      | (set(audio_rows_t.unique().tolist()) if audio_rows_t is not None else set()))
+    t_row = {t: i for i, t in enumerate(unique_t)}
+"""
+
+# --- the shapes we know how to patch ----------------------------------------
+#
+# (name, anchor 1, replacement 1, self-check start marker)
+#
+# The marker is where the self-check slices the patched source from. The first
+# two shapes rebuild seg_t inside their block, so theirs starts at "vis_aug";
+# the 0.45 shape starts at "_vid_augs" because the masked-row maths between
+# seg_t and unique_t is not part of the replaced region.
+
+_SHAPES = (
+    ("pre-e01fb4c", _FWD_OLD_1_OLD_CORE, _FWD_NEW_1, "    vis_aug ="),
+    ("e01fb4c", _FWD_OLD_1_NEW_CORE, _FWD_NEW_1, "    vis_aug ="),
+    ("v0.45-masked", _FWD_OLD_1_V045, _FWD_NEW_1_V045, "    _vid_augs ="),
+)
 
 # --- the two row builders, verified verbatim before replacement --------------
 
@@ -226,15 +293,15 @@ def _install():
     except (OSError, TypeError) as exc:
         logging.warning("H3Studio: cannot read _forward source (%s).", exc)
         return False
-    anchor = next((a for a in (_FWD_OLD_1_NEW_CORE, _FWD_OLD_1_OLD_CORE)
-                   if fwd_src.count(a) == 1), None)
-    if anchor is None or fwd_src.count(_FWD_OLD_2) != 1:
+    shape = next((s for s in _SHAPES if fwd_src.count(s[1]) == 1), None)
+    if shape is None or fwd_src.count(_FWD_OLD_2) != 1:
         logging.warning("H3Studio: core's _forward timestep table changed "
                         "upstream; per-row strength labels unavailable "
                         "(using blended fallback). Keyframe and motion-context "
                         "strengths below 1.0 will be softer and less clean.")
         return False
-    new_src = fwd_src.replace(anchor, _FWD_NEW_1, 1).replace(_FWD_OLD_2, _FWD_NEW_2, 1)
+    name, old_1, new_1, marker = shape
+    new_src = fwd_src.replace(old_1, new_1, 1).replace(_FWD_OLD_2, _FWD_NEW_2, 1)
     ns = {}
     try:
         exec(compile(new_src, "<h3studio _forward row-aug>", "exec"), _mmm.__dict__, ns)
@@ -243,7 +310,7 @@ def _install():
                         type(exc).__name__, exc)
         return False
     new_forward = ns["_forward"]
-    if not _self_check(new_src):
+    if not _self_check(new_src, marker):
         return False
     new_forward._guide_row_aug = True
     _cond_video_rows_rowaug._guide_row_aug = True
@@ -252,11 +319,11 @@ def _install():
     model_cls._cond_video_rows = _cond_video_rows_rowaug
     model_cls._cond_audio_rows = _cond_audio_rows_rowaug
     logging.info("H3Studio: per-row condition noise-aug labels installed "
-                 "(video + audio).")
+                 "(video + audio) on core shape %s.", name)
     return True
 
 
-def _self_check(src):
+def _self_check(src, marker="    vis_aug ="):
     """Run the patched timestep table over a real layout, without a model.
 
     The substitution is textual, so it compiles happily even if the table it
@@ -266,9 +333,14 @@ def _self_check(src):
 
     `src` is the patched source we just built -- the compiled function has no
     entry in linecache, so it cannot be read back with inspect.
+
+    `marker` is where the replaced region starts, which depends on the core
+    shape: the first two shapes rebuild seg_t inside the region, so theirs
+    starts at "vis_aug"; the 0.45 shape starts at "_vid_augs", because the
+    masked-row maths in between is core's and must not be re-executed here.
     """
     try:
-        start = src.index("    vis_aug =")
+        start = src.index(marker)
         stop = src.index("    t_row = {t: i for i, t in enumerate(unique_t)}")
         stop += len("    t_row = {t: i for i, t in enumerate(unique_t)}\n")
         block = textwrap.dedent(src[start:stop])
@@ -278,7 +350,17 @@ def _self_check(src):
             keyframes=[{"resolved_frame_index": 0,
                         "latent": torch.zeros(1, 24, 1, 4, 4)}])
         t_v, t_a = 0.4, 0.3
+        stock = {"text": t_v, "video": t_v, "audio": t_a,
+                 "cond": max(t_v, _mmm.VISUAL_COND_TIMESTEP),
+                 "ref_img": max(t_v, _mmm.VISUAL_COND_TIMESTEP),
+                 "cond_audio": max(t_a, _mmm.AUDIO_COND_TIMESTEP),
+                 "ref_audio": max(t_a, _mmm.AUDIO_COND_TIMESTEP)}
+        # seg_t and the masked-row holders are seeded because the 0.45 shape
+        # keeps them outside the replaced region; the first two shapes rebuild
+        # seg_t inside it and simply overwrite the seed.
         env = {"payload": {}, "layout": layout, "t_v": t_v, "t_a": t_a,
+               "seg_t": dict(stock),
+               "video_rows_t": None, "audio_rows_t": None,
                "VISUAL_COND_TIMESTEP": _mmm.VISUAL_COND_TIMESTEP,
                "AUDIO_COND_TIMESTEP": _mmm.AUDIO_COND_TIMESTEP}
         exec(compile(block, "<h3studio row-aug self-check>", "exec"), env, env)
@@ -286,17 +368,25 @@ def _self_check(src):
         if len(seg_ts) != len(layout.segments):
             raise ValueError("%d labels for %d segments"
                              % (len(seg_ts), len(layout.segments)))
-        stock = {"text": t_v, "video": t_v, "audio": t_a,
-                 "cond": max(t_v, _mmm.VISUAL_COND_TIMESTEP),
-                 "ref_img": max(t_v, _mmm.VISUAL_COND_TIMESTEP),
-                 "cond_audio": max(t_a, _mmm.AUDIO_COND_TIMESTEP),
-                 "ref_audio": max(t_a, _mmm.AUDIO_COND_TIMESTEP)}
         for (_, _, kind), got in zip(layout.segments, seg_ts):
             if abs(got - stock[kind]) > 1e-12:
                 raise ValueError("%r labelled %r, stock says %r"
                                  % (kind, got, stock[kind]))
         if any(t not in t_row for t in seg_ts):
             raise ValueError("a segment label is missing from t_row")
+        if "video_rows_t" in block:
+            # This core shape has masked rows: their timesteps are looked up
+            # per row by rows_to_mod_index(), so they have to survive in t_row.
+            # The replacement must carry those unions over, or a denoise mask
+            # raises KeyError at sampling time.
+            env2 = dict(env)
+            env2["video_rows_t"] = torch.tensor([0.11, 0.37])
+            exec(compile(block, "<h3studio row-aug masked-row check>", "exec"),
+                 env2, env2)
+            for v in env2["video_rows_t"].unique().tolist():
+                if v not in env2["t_row"]:
+                    raise ValueError("masked row timestep %r is missing from t_row"
+                                     % (v,))
     except Exception as exc:
         logging.warning("H3Studio: per-row label self-check failed (%s: %s); "
                         "leaving core alone and using the blended fallback.",
