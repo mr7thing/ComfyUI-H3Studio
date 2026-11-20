@@ -29,6 +29,15 @@ because core looks them up per row by `rows_to_mod_index()`.
 The first two core shapes still work exactly as upstream. If core changes
 again, the patch fails loudly and falls back to blending, as before.
 
+A second change, smaller: **the keyframe dictionary now keeps its `strength`**.
+The `noise_aug` label is written only on the flow-blend path, so a keyframe
+without a label is either at full strength or was weakened by the fallback
+path -- and the consumer cannot tell those two apart without the number. The
+field is inert for the core (the core reads a keyframe's `latent` and
+`noise_aug`); it only tells the other side what happened to the frame, so a
+downstream sampler can say whether a frame lost noise it cannot restore. This
+is what the SelfLift side's collaboration contract asks for as §7.1.
+
 Install from this fork:
 
 ```bash

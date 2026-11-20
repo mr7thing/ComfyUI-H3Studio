@@ -2011,6 +2011,14 @@ class H3StudioImageToVideo(io.ComfyNode):
                 z = vae.encode(kf.pop("image"))
                 s = kf.pop("strength")
                 seed = kf.pop("noise_seed")
+                # The strength stays in the keyframe dictionary on purpose. The
+                # 'noise_aug' label is only written on the flow-blend path, so a
+                # keyframe without a label is either at full strength or was
+                # weakened by the fallback path -- and the consumer cannot tell
+                # those two apart without this number. It is inert for the core
+                # (the core reads the keyframe's 'latent' and 'noise_aug'), it
+                # only tells the other side what happened to the frame.
+                kf["strength"] = s
                 if s < 1.0 and row_aug_ready():
                     kf["noise_aug"] = s * _VIS_T
                     kf["latent"] = flow_blend(z, kf["noise_aug"], seed)
